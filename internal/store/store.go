@@ -7,6 +7,7 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 )
 
@@ -98,14 +99,18 @@ func ReadRecordAt(r io.ReaderAt, offset int64) (op byte, key string, value []byt
 	return
 }
 
+const defaultCompactionThreshold = 32 * 1024 * 1024 // 32 MB
+
 // Store is a single-node key-value store backed by a binary append-only log.
 // The in-memory index maps each key to the byte offset of its latest log entry.
 // All operations acquire a mutex to prevent interleaved log entries and index corruption.
 type Store struct {
-	mu       sync.Mutex
-	file     *os.File
-	index    map[string]int64 // key → byte offset of latest record
-	writePos int64            // current end-of-file; next write goes here
+	mu                  sync.Mutex
+	file                *os.File
+	path                string
+	index               map[string]int64 // key → byte offset of latest record
+	writePos            int64            // current end-of-file; next write goes here
+	compactionThreshold int64
 }
 
 // Open opens (or creates) the log file at path and replays it to rebuild the index.
@@ -115,8 +120,10 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	s := &Store{
-		file:  f,
-		index: make(map[string]int64),
+		file:                f,
+		path:                path,
+		index:               make(map[string]int64),
+		compactionThreshold: defaultCompactionThreshold,
 	}
 	if err := s.replay(); err != nil {
 		f.Close()
@@ -210,7 +217,13 @@ func (s *Store) Put(key string, value []byte) error {
 	}
 	s.writePos += int64(len(rec))
 	s.index[key] = offset
-	return s.file.Sync()
+	if err := s.file.Sync(); err != nil {
+		return err
+	}
+	if s.writePos >= s.compactionThreshold {
+		_ = s.compact()
+	}
+	return nil
 }
 
 // Delete appends a tombstone record to the log and removes the key from the index.
@@ -228,5 +241,75 @@ func (s *Store) Delete(key string) error {
 	}
 	s.writePos += int64(len(rec))
 	delete(s.index, key)
-	return s.file.Sync()
+	if err := s.file.Sync(); err != nil {
+		return err
+	}
+	if s.writePos >= s.compactionThreshold {
+		_ = s.compact()
+	}
+	return nil
+}
+
+// Compact rewrites the log to contain only live keys, atomically replacing the data file.
+// It is safe to call concurrently — it acquires the store lock for the duration.
+func (s *Store) Compact() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.compact()
+}
+
+// compact is the lock-held implementation of Compact.
+func (s *Store) compact() error {
+	dir := filepath.Dir(s.path)
+	tmp, err := os.CreateTemp(dir, "kv-compact-*.log")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+
+	// Write one PUT record per live key into the temp file.
+	newIndex := make(map[string]int64, len(s.index))
+	var pos int64
+	for key, offset := range s.index {
+		_, _, value, _, err := ReadRecordAt(s.file, offset)
+		if err != nil {
+			tmp.Close()
+			os.Remove(tmpPath)
+			return fmt.Errorf("compact: read %q: %w", key, err)
+		}
+		rec := EncodeRecord(OpPut, key, value)
+		if _, err := tmp.WriteAt(rec, pos); err != nil {
+			tmp.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+		newIndex[key] = pos
+		pos += int64(len(rec))
+	}
+
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+
+	// Atomic replace: old log → compacted log.
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+
+	s.file.Close()
+	f, err := os.OpenFile(s.path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return err
+	}
+	s.file = f
+	s.index = newIndex
+	s.writePos = pos
+	return nil
 }
