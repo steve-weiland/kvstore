@@ -1,32 +1,110 @@
 package store
 
 import (
-	"bufio"
-	"encoding/base64"
-	"encoding/json"
+	"encoding/binary"
 	"errors"
+	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"sync"
 )
 
-const maxLineSize = 128 * 1024 // 1 KB key + 64 KB value base64-encoded ≈ 88 KB; 128 KB is safe headroom
+// Record layout:
+//
+//	┌──────────┬─────────┬─────────┬─────┬─────────────┬─────────────┐
+//	│  crc32   │ key_sz  │ val_sz  │ op  │    key      │    value    │
+//	│  4 bytes │ 2 bytes │ 4 bytes │ 1 B │ key_sz bytes│ val_sz bytes│
+//	└──────────┴─────────┴─────────┴─────┴─────────────┴─────────────┘
+//
+// crc32 covers bytes [4..end]: key_sz, val_sz, op, key, value. Big-endian.
+const RecordHeaderSize = 11 // 4 + 2 + 4 + 1
 
-var ErrNotFound = errors.New("key not found")
+const (
+	OpPut = byte(0x01)
+	OpDel = byte(0x02)
+)
 
-type entry struct {
-	Op    string `json:"op"`
-	Key   string `json:"key"`
-	Value string `json:"value,omitempty"` // base64-encoded; omitted on tombstones
+var (
+	ErrNotFound = errors.New("key not found")
+	ErrCorrupt  = errors.New("corrupt log entry")
+)
+
+// EncodeRecord encodes a log record into the binary wire format.
+// Exported for use by the hint file writer and tests.
+func EncodeRecord(op byte, key string, value []byte) []byte {
+	keySz := len(key)
+	valSz := len(value)
+	buf := make([]byte, RecordHeaderSize+keySz+valSz)
+
+	binary.BigEndian.PutUint16(buf[4:6], uint16(keySz))
+	binary.BigEndian.PutUint32(buf[6:10], uint32(valSz))
+	buf[10] = op
+	copy(buf[RecordHeaderSize:], key)
+	copy(buf[RecordHeaderSize+keySz:], value)
+
+	checksum := crc32.ChecksumIEEE(buf[4:])
+	binary.BigEndian.PutUint32(buf[0:4], checksum)
+	return buf
 }
 
-// Store is a single-node key-value store backed by an append-only log.
+// ReadRecordAt reads and validates the record at offset in r.
+// Returns the record fields, total size in bytes, and any error.
+// ErrCorrupt means a full record was present but CRC mismatched.
+// io.ErrUnexpectedEOF means the record was truncated (torn write).
+// size is always populated from the header when available, even on error,
+// so the caller can determine whether the corrupt record was the last one.
+func ReadRecordAt(r io.ReaderAt, offset int64) (op byte, key string, value []byte, size int64, err error) {
+	hdr := make([]byte, RecordHeaderSize)
+	n, readErr := r.ReadAt(hdr, offset)
+	if n < RecordHeaderSize {
+		err = io.ErrUnexpectedEOF
+		return
+	}
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		err = readErr
+		return
+	}
+
+	keySz := int(binary.BigEndian.Uint16(hdr[4:6]))
+	valSz := int(binary.BigEndian.Uint32(hdr[6:10]))
+	size = int64(RecordHeaderSize + keySz + valSz)
+
+	payload := make([]byte, keySz+valSz)
+	if len(payload) > 0 {
+		n, readErr = r.ReadAt(payload, offset+RecordHeaderSize)
+		if n < len(payload) {
+			err = io.ErrUnexpectedEOF
+			return
+		}
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			err = readErr
+			return
+		}
+	}
+
+	storedCRC := binary.BigEndian.Uint32(hdr[0:4])
+	h := crc32.NewIEEE()
+	h.Write(hdr[4:]) // key_sz + val_sz + op
+	h.Write(payload) // key + value
+	if h.Sum32() != storedCRC {
+		err = ErrCorrupt
+		return
+	}
+
+	op = hdr[10]
+	key = string(payload[:keySz])
+	value = payload[keySz:] // empty slice for tombstones (valSz == 0)
+	return
+}
+
+// Store is a single-node key-value store backed by a binary append-only log.
 // The in-memory index maps each key to the byte offset of its latest log entry.
 // All operations acquire a mutex to prevent interleaved log entries and index corruption.
 type Store struct {
 	mu       sync.Mutex
 	file     *os.File
-	index    map[string]int64 // key → byte offset of latest entry line
+	index    map[string]int64 // key → byte offset of latest record
 	writePos int64            // current end-of-file; next write goes here
 }
 
@@ -47,36 +125,60 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// replay scans the log from byte 0, rebuilds the index, and sets writePos to the end of the log.
+// replay scans the log from byte 0, rebuilds the index, and sets writePos.
+// A torn tail write (io.ErrUnexpectedEOF or last-record CRC mismatch) is
+// recovered by truncating the file to the last good record.
+// A CRC mismatch on a non-final record returns ErrCorrupt.
 func (s *Store) replay() error {
-	if _, err := s.file.Seek(0, io.SeekStart); err != nil {
+	info, err := s.file.Stat()
+	if err != nil {
 		return err
 	}
-	scanner := bufio.NewScanner(s.file)
-	scanner.Buffer(make([]byte, maxLineSize), maxLineSize)
-
+	fileSize := info.Size()
 	var offset int64
-	for scanner.Scan() {
-		line := scanner.Bytes()
-		lineLen := int64(len(line)) + 1 // Scanner strips '\n'; account for it
 
-		var e entry
-		if err := json.Unmarshal(line, &e); err != nil {
-			// V1: skip corrupt lines silently (no checksums yet)
-			offset += lineLen
-			continue
+	for offset < fileSize {
+		op, key, _, size, err := ReadRecordAt(s.file, offset)
+		if err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				// Partial record at tail: truncate and recover.
+				return s.truncateToOffset(offset)
+			}
+			if errors.Is(err, ErrCorrupt) {
+				// Full record present but CRC wrong.
+				if offset+size >= fileSize {
+					// Last record: treat as tail corruption (partial OS flush).
+					return s.truncateToOffset(offset)
+				}
+				// Mid-file: serious corruption, do not silently skip.
+				return fmt.Errorf("corrupt record at offset %d: %w", offset, ErrCorrupt)
+			}
+			return err
 		}
 
-		switch e.Op {
-		case "put":
-			s.index[e.Key] = offset
-		case "del":
-			delete(s.index, e.Key)
+		switch op {
+		case OpPut:
+			s.index[key] = offset
+		case OpDel:
+			delete(s.index, key)
 		}
-		offset += lineLen
+		offset += size
 	}
 	s.writePos = offset
-	return scanner.Err()
+	return nil
+}
+
+func (s *Store) truncateToOffset(offset int64) error {
+	if err := s.file.Truncate(offset); err != nil {
+		return err
+	}
+	s.writePos = offset
+	return nil
+}
+
+// Close releases the underlying file descriptor.
+func (s *Store) Close() error {
+	return s.file.Close()
 }
 
 // Get returns the value for key, or ErrNotFound if the key is absent or tombstoned.
@@ -89,44 +191,29 @@ func (s *Store) Get(key string) ([]byte, error) {
 		return nil, ErrNotFound
 	}
 
-	if _, err := s.file.Seek(offset, io.SeekStart); err != nil {
+	_, _, value, _, err := ReadRecordAt(s.file, offset)
+	if err != nil {
 		return nil, err
 	}
-	// Fresh reader each call: reusing a buffered reader across seeks would return stale buffered data.
-	line, err := bufio.NewReader(s.file).ReadBytes('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, err
-	}
-
-	var e entry
-	if err := json.Unmarshal(line, &e); err != nil {
-		return nil, err
-	}
-	return base64.StdEncoding.DecodeString(e.Value)
+	return value, nil
 }
 
-// Put appends a PUT entry to the log and updates the index.
+// Put appends a PUT record to the log and updates the index.
 func (s *Store) Put(key string, value []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e := entry{Op: "put", Key: key, Value: base64.StdEncoding.EncodeToString(value)}
-	line, err := json.Marshal(e)
-	if err != nil {
-		return err
-	}
-	line = append(line, '\n')
-
+	rec := EncodeRecord(OpPut, key, value)
 	offset := s.writePos
-	if _, err := s.file.WriteAt(line, offset); err != nil {
+	if _, err := s.file.WriteAt(rec, offset); err != nil {
 		return err
 	}
-	s.writePos += int64(len(line))
+	s.writePos += int64(len(rec))
 	s.index[key] = offset
 	return nil
 }
 
-// Delete appends a tombstone entry to the log and removes the key from the index.
+// Delete appends a tombstone record to the log and removes the key from the index.
 func (s *Store) Delete(key string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -135,17 +222,11 @@ func (s *Store) Delete(key string) error {
 		return ErrNotFound
 	}
 
-	e := entry{Op: "del", Key: key}
-	line, err := json.Marshal(e)
-	if err != nil {
+	rec := EncodeRecord(OpDel, key, nil)
+	if _, err := s.file.WriteAt(rec, s.writePos); err != nil {
 		return err
 	}
-	line = append(line, '\n')
-
-	if _, err := s.file.WriteAt(line, s.writePos); err != nil {
-		return err
-	}
-	s.writePos += int64(len(line))
+	s.writePos += int64(len(rec))
 	delete(s.index, key)
 	return nil
 }

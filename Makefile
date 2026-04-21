@@ -2,6 +2,7 @@
 
 build:
 	go build -o bin/kvserver ./cmd/kvserver
+	go build -o bin/kvdump ./cmd/kvdump
 
 test:
 	go test -race ./...

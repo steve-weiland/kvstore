@@ -1,8 +1,8 @@
-# Key-Value Store — V1 (Single-Node)
+# Key-Value Store — V2 (Durable + Distributed)
 
 | Field   | Value              |
 |---------|--------------------|
-| Version | 0.2 (draft)        |
+| Version | 0.3 (draft)        |
 | Author  | Steve Weiland       |
 | Date    | 2026-04-21         |
 | Status  | In review          |
@@ -11,9 +11,22 @@
 
 ## 1. Overview
 
-A single-node, persistent key-value store exposed over HTTP. Every mutation (PUT, DELETE) is appended to an on-disk log file; an in-memory hash table maps each key to the byte offset of its most recent log entry, giving O(1) reads without scanning the log. On process startup, the index is rebuilt by replaying the log from the beginning.
+A three-node, Raft-replicated key-value store exposed over HTTP. Every mutation is written to
+a binary append-only log with a CRC32 checksum and fsynced before acknowledgement. An in-memory
+index maps each key to its latest log offset for O(1) reads. On startup the index is rebuilt
+from a hint file (O(live keys)) if present, otherwise from a full log replay. The log is
+compacted when it exceeds a configurable size threshold.
 
-V1 is deliberately minimal: no fsync, no checksums, no compaction. These omissions are intentional failure modes to explore in the break-it phase (kill the process mid-write; corrupt the log file) before fixing them in V2 with a WAL and crash-recovery path.
+V2 fixes the six deliberate weaknesses documented in V1:
+
+| V1 failure | V2 fix |
+|-----------|--------|
+| No fsync → torn write = data loss | WAL + fsync on every write |
+| No checksums → corruption is silent | CRC32 per record; error on mismatch |
+| No compaction → log grows unbounded | Atomic single-file compaction |
+| Tombstones never reclaimed | Compaction drops tombstones and dead values |
+| Replay is O(write history) | Hint file enables O(live keys) startup |
+| Single node → no fault tolerance | Raft replication across 3 nodes |
 
 ---
 
@@ -21,11 +34,17 @@ V1 is deliberately minimal: no fsync, no checksums, no compaction. These omissio
 
 | Term | Definition |
 |------|------------|
-| Entry | One log record representing a single mutation (PUT or DELETE) |
-| Tombstone | A DELETE entry; signals that a key no longer has a live value |
-| Index | In-memory `map[string]int64` from key to the byte offset of its latest entry |
-| Segment | The single append-only log file used in V1 (multi-segment compaction is out of scope) |
-| Replay | Sequential scan of the log on startup to reconstruct the index |
+| Entry | One binary log record representing a single mutation (PUT or DELETE) |
+| Tombstone | A DELETE entry; op byte = `0x02`; val_sz = 0 |
+| Index | In-memory `map[string]int64` from key to byte offset of its latest entry |
+| WAL | Write-ahead log; mutations are durable on disk before the client is acknowledged |
+| CRC32 | IEEE CRC32 checksum covering key_sz, val_sz, op, key, and value bytes |
+| Compaction | Rewriting only live entries to a new data file, atomically replacing the old one |
+| Hint file | Companion file written after compaction; maps each live key to its data-file offset for fast index rebuild |
+| Replay | Sequential scan of the data file to reconstruct the index when no hint file is present |
+| FSM | Finite state machine; the Store implements `raft.FSM` so Raft can apply committed commands |
+| Leader | The Raft node that accepts writes; other nodes redirect writes to the leader |
+| Quorum | (N/2)+1 nodes; a write is committed once the leader replicates it to a quorum |
 
 ---
 
@@ -33,100 +52,150 @@ V1 is deliberately minimal: no fsync, no checksums, no compaction. These omissio
 
 Requirements use [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) keywords: **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, **MAY**.
 
-| ID    | Requirement |
-|-------|-------------|
+### 3.1 Storage
+
+| ID | Requirement |
+|----|-------------|
 | KV‑01 | The server **MUST** accept PUT, GET, and DELETE operations via HTTP. |
-| KV‑02 | The server **MUST** append a log entry for every mutation before sending the HTTP response. |
-| KV‑03 | The server **MUST** maintain an in-memory index for O(1) key lookups (no log scan per read). |
-| KV‑04 | On startup, the server **MUST** rebuild the index by replaying the full log from byte 0. |
-| KV‑05 | A DELETE operation **MUST** append a tombstone entry rather than removing prior entries. |
+| KV‑02 | The server **MUST** append a log entry and receive Raft commit confirmation before sending the HTTP response. |
+| KV‑03 | The server **MUST** maintain an in-memory index for O(1) key lookups. |
+| KV‑04 | On startup, the server **MUST** load the hint file if present to rebuild the index in O(live keys); if absent or corrupt it **MUST** fall back to full log replay. |
+| KV‑05 | A DELETE operation **MUST** append a tombstone entry (op = `0x02`, val_sz = 0). |
 | KV‑06 | Keys **MUST** be non-empty UTF-8 strings of at most 1 KB. |
 | KV‑07 | Values **MUST** be arbitrary bytes of at most 64 KB. |
-| KV‑08 | The server **MUST NOT** call `fsync`/`fdatasync` after appending log entries. OS-buffered writes are acceptable in V1. |
-| KV‑09 | The server **SHOULD** return `404 Not Found` for GET or DELETE on a key that is absent or tombstoned. |
-| KV‑10 | The server **SHOULD** return `400 Bad Request` for an empty key or an oversized payload. |
-| KV‑11 | The log file path and HTTP listen address **SHOULD** be configurable via CLI flags or environment variables. |
-| KV‑12 | Concurrent HTTP requests **SHOULD** be serialized through a single write lock so log entries are never interleaved. |
-| KV‑13 | Log entries **MUST** use newline-delimited JSON. Each entry is one UTF-8 line terminated by `\n`. PUT entries encode the value as standard base64: `{"op":"put","key":"<key>","value":"<base64>"}`. DELETE tombstones omit the value field: `{"op":"del","key":"<key>"}`. |
-| KV‑14 | The server **MAY** expose `GET /health` returning `200 OK` with process uptime. |
-| KV‑15 | The server **MAY** expose `GET /keys` returning a JSON array of all live keys. |
+| KV‑08 | The server **MUST** call `fsync`/`fdatasync` after every log write before updating the in-memory index. |
+| KV‑09 | Each log entry **MUST** include a CRC32 checksum covering key_sz, val_sz, op, key, and value. |
+| KV‑10 | On replay, a CRC mismatch on the final record (torn write) **MUST** cause the file to be truncated to the last good record; the store **MUST** open successfully. |
+| KV‑11 | A CRC mismatch on any non-final record **MUST** cause `Open()` to return an error. |
+| KV‑12 | The server **MUST** compact the log when the data file exceeds the compaction threshold. |
+| KV‑13 | After compaction, the server **MUST** write a hint file alongside the data file. |
+| KV‑14 | The compaction threshold **SHOULD** default to 32 MB and be configurable via CLI flag. |
+
+### 3.2 HTTP API
+
+| ID | Requirement |
+|----|-------------|
+| KV‑15 | The server **SHOULD** return `404 Not Found` for GET or DELETE on a key that is absent or tombstoned. |
+| KV‑16 | The server **SHOULD** return `400 Bad Request` for an empty key or oversized payload. |
+| KV‑17 | A non-leader node receiving a write **MUST** respond `307 Temporary Redirect` with a `Location` header pointing to the current leader's HTTP address. |
+| KV‑18 | `GET /keys/{key}` **SHOULD** serve a potentially stale local read by default. |
+| KV‑19 | `GET /keys/{key}?consistent=true` **MUST** call `raft.Barrier()` before reading, guaranteeing linearizability. |
+| KV‑20 | The server **MAY** expose `GET /health` returning Raft state (role, leader address) and process uptime. |
+| KV‑21 | The server **MAY** expose `GET /keys` returning a JSON array of all live keys. |
+
+### 3.3 Cluster
+
+| ID | Requirement |
+|----|-------------|
+| KV‑22 | A write **MUST** be replicated to a quorum of nodes before being committed. |
+| KV‑23 | Node identity, Raft bind address, HTTP bind address, initial peer list, and data directory **MUST** be configurable via CLI flags. |
+| KV‑24 | The cluster **SHOULD** consist of exactly 3 nodes for a quorum of 2. |
+| KV‑25 | Each node **MUST** use BoltDB-backed LogStore and StableStore (`hashicorp/raft-boltdb`). |
 
 ---
 
 ## 4. Inputs / Outputs
 
+### HTTP API (unchanged from V1)
+
 ```
-// Store or overwrite a value
 PUT /keys/{key}
   Content-Type: application/octet-stream
   Body: raw bytes (≤ 64 KB); key in URL must be ≤ 1 KB
 
   204 No Content
-
-  400 Bad Request  { "error": "key must not be empty" }
-  400 Bad Request  { "error": "value exceeds maximum size" }
+  307 Temporary Redirect   Location: http://<leader-addr>/keys/{key}
+  400 Bad Request          { "error": "key must not be empty" }
   413 Payload Too Large
+  503 Service Unavailable  { "error": "no leader elected" }
 
 
-// Retrieve a value
 GET /keys/{key}
+GET /keys/{key}?consistent=true
 
   200 OK
   Content-Type: application/octet-stream
-  Body: raw bytes (decoded from base64 in log)
+  Body: raw bytes
 
   404 Not Found    { "error": "key not found" }
 
 
-// Delete a key
 DELETE /keys/{key}
 
   204 No Content
+  307 Temporary Redirect   Location: http://<leader-addr>/keys/{key}
+  404 Not Found            { "error": "key not found" }
 
-  404 Not Found    { "error": "key not found" }
 
-
-// Health check (optional)
 GET /health
 
-  200 OK           { "status": "ok", "uptime_seconds": 42 }
+  200 OK
+  {
+    "status": "ok",
+    "raft_role": "leader" | "follower" | "candidate",
+    "raft_leader": "http://127.0.0.1:8081",
+    "uptime_seconds": 42
+  }
 ```
 
-### Log entry format
-
-Each line in the log file is a complete JSON object followed by `\n`. The index maps each key to the **byte offset of the start of its most recent entry line**; on GET the server seeks to that offset, reads until `\n`, parses JSON, and base64-decodes the value.
+### Binary log record format
 
 ```
-// PUT entry
-{"op":"put","key":"session:abc","value":"aGVsbG8gd29ybGQ="}
+┌──────────┬─────────┬─────────┬─────┬─────────────┬─────────────┐
+│  crc32   │ key_sz  │ val_sz  │ op  │    key      │    value    │
+│  4 bytes │ 2 bytes │ 4 bytes │ 1 B │ key_sz bytes│ val_sz bytes│
+└──────────┴─────────┴─────────┴─────┴─────────────┴─────────────┘
 
-// DELETE tombstone
-{"op":"del","key":"session:abc"}
+op:    0x01 = PUT   0x02 = DELETE (val_sz = 0, no value bytes)
+crc32: IEEE CRC32 over bytes [4..end] (key_sz through end of value)
+byte order: big-endian
 ```
 
-On index rebuild (startup), entries are processed left-to-right: each PUT overwrites the index for that key; each tombstone removes the key from the index.
+### Hint file record format
+
+One record per live key, written after every compaction. No CRC (hint is advisory; corrupt hint
+falls back to full replay).
+
+```
+┌─────────┬─────────┬────────────┬──────────────┐
+│ key_sz  │ val_sz  │  val_pos   │     key      │
+│ 2 bytes │ 4 bytes │  8 bytes   │ key_sz bytes │
+└─────────┴─────────┴────────────┴──────────────┘
+
+val_pos: byte offset of the record's start in data.log
+byte order: big-endian
+```
+
+### CLI flags (`kvserver`)
+
+```
+--node-id     string   unique node name, e.g. "node1"
+--raft-addr   string   Raft TCP bind address, e.g. "127.0.0.1:7000"
+--http-addr   string   HTTP listen address (default ":9090")
+--peers       string   comma-separated id=raft-addr pairs, e.g. "node2=127.0.0.1:7001,node3=127.0.0.1:7002"
+--data-dir    string   directory for data.log, data.log.hint, raft.db, snapshots
+--compact-mb  int      compaction threshold in MB (default 32)
+```
 
 ---
 
 ## 5. Out of Scope
 
-The following are explicitly excluded from V1:
-
-- `fsync` or any durability guarantee (added in V2)
-- Log checksums or entry-level CRC (added in V2)
-- Crash recovery from a partially-written entry (added in V2)
-- Raft replication or any multi-node coordination (added in V2)
-- Log compaction or segment merging (stretch goal in V2)
 - Authentication, TLS, or access control
 - TTL / key expiration
 - Multi-key transactions or atomic batches
+- Multi-segment log files (single-file compaction is sufficient for V2)
 - Log format versioning or schema migration
+- Dynamic cluster membership changes (static peer list only in V2)
 
 ---
 
 ## 6. Open Questions
 
-None.
+| # | Question | Owner | Due |
+|---|----------|-------|-----|
+| Q1 | **Compaction trigger**: size threshold only, or also time-based (e.g. every 1h)? Size-only is simpler; time-based helps workloads with mostly deletes. | Steve | Step 2 |
+| Q2 | **Leader redirect**: should the server proxy the write to the leader (transparent to client) or return a 307 (client must retry)? 307 is simpler; proxying hides topology from clients. | Steve | Step 4 |
 
 ---
 
@@ -136,3 +205,4 @@ None.
 |---------|------|--------|-------|
 | 0.1 | 2026-04-21 | Steve Weiland | Initial V1 draft |
 | 0.2 | 2026-04-21 | Steve Weiland | Resolved Q1–Q3: JSON-lines log format, octet-stream HTTP, full log replay |
+| 0.3 | 2026-04-21 | Steve Weiland | V2 draft: binary log + CRC, WAL/fsync, compaction, hint file, Raft replication |
