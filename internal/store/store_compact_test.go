@@ -14,7 +14,7 @@ func TestCompactReducesFileSize(t *testing.T) {
 	f, _ := os.CreateTemp("", "kv-compact-*.log")
 	path := f.Name()
 	f.Close()
-	t.Cleanup(func() { os.Remove(path) })
+	t.Cleanup(func() { os.Remove(path); os.Remove(path + ".hint") })
 
 	s, _ := store.Open(path)
 	const N = 100
@@ -50,7 +50,7 @@ func TestCompactReclaimsTombstones(t *testing.T) {
 	f, _ := os.CreateTemp("", "kv-compact-*.log")
 	path := f.Name()
 	f.Close()
-	t.Cleanup(func() { os.Remove(path) })
+	t.Cleanup(func() { os.Remove(path); os.Remove(path + ".hint") })
 
 	s, _ := store.Open(path)
 	const N = 50
@@ -77,7 +77,7 @@ func TestCompactPreservesAllLiveKeys(t *testing.T) {
 	f, _ := os.CreateTemp("", "kv-compact-*.log")
 	path := f.Name()
 	f.Close()
-	t.Cleanup(func() { os.Remove(path) })
+	t.Cleanup(func() { os.Remove(path); os.Remove(path + ".hint") })
 
 	s, _ := store.Open(path)
 	const N = 200
@@ -101,13 +101,13 @@ func TestCompactPreservesAllLiveKeys(t *testing.T) {
 	}
 }
 
-// TestCompactSurvivesReopen verifies that the compacted log can be replayed
-// from scratch and all keys remain accessible after reopen.
+// TestCompactSurvivesReopen verifies that the compacted log (and hint file) can
+// be used to restore all keys after a reopen.
 func TestCompactSurvivesReopen(t *testing.T) {
 	f, _ := os.CreateTemp("", "kv-compact-*.log")
 	path := f.Name()
 	f.Close()
-	t.Cleanup(func() { os.Remove(path) })
+	t.Cleanup(func() { os.Remove(path); os.Remove(path + ".hint") })
 
 	s, _ := store.Open(path)
 	_ = s.Put("a", []byte("1"))

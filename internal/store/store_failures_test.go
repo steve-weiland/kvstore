@@ -158,17 +158,14 @@ func TestDeleteDoesNotReclaimDisk(t *testing.T) {
 	}
 }
 
-// TestReplayScansFullLogHistory documents that startup time is O(total write history),
-// not O(live keys). There is no compaction, no hint file, no segment boundary —
-// Open must scan every byte ever written.
-//
-// No hard time assertion: this is an observability test. Run it before and after V2
-// adds compaction and compare the t.Logf output.
+// TestReplayScansFullLogHistory shows the O(write history) vs O(live keys) startup
+// difference. Without compaction the store replays every record ever written;
+// with compaction + hint file it loads only the live index and replays the tail.
 func TestReplayScansFullLogHistory(t *testing.T) {
 	f, _ := os.CreateTemp("", "kv-failure-*.log")
 	path := f.Name()
 	f.Close()
-	t.Cleanup(func() { os.Remove(path) })
+	t.Cleanup(func() { os.Remove(path); os.Remove(path + ".hint") })
 
 	s, _ := store.Open(path)
 	const N = 10_000
@@ -178,17 +175,28 @@ func TestReplayScansFullLogHistory(t *testing.T) {
 	info, _ := os.Stat(path)
 	t.Logf("log size after %d writes to same key: %d bytes", N, info.Size())
 
+	// V1 path: full replay without compaction.
 	start := time.Now()
 	s2, err := store.Open(path)
-	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("replaying %d stale entries took %v", N, elapsed)
+	t.Logf("full replay (%d stale entries): %v", N, time.Since(start))
 
-	got, err := s2.Get("key")
+	// V2 path: compact (produces hint file), then measure hint-assisted reopen.
+	if err := s2.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	start = time.Now()
+	s3, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("hint-assisted reopen (1 live key): %v", time.Since(start))
+
+	got, err := s3.Get("key")
 	if err != nil || string(got) != "value" {
-		t.Fatalf("latest value wrong after replay: err=%v got=%q", err, got)
+		t.Fatalf("latest value wrong after hint reopen: err=%v got=%q", err, got)
 	}
 }
 

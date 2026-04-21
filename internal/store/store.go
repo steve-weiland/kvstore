@@ -31,6 +31,21 @@ var (
 	ErrCorrupt  = errors.New("corrupt log entry")
 )
 
+// Hint file layout:
+//
+//	[compact_size : 8 bytes]           ← data file size at compaction time
+//	[key_sz : 2][val_sz : 4][val_pos : 8][key : key_sz bytes]  ← one per live key
+const (
+	hintFileHeaderSize  = 8
+	hintEntryHeaderSize = 14 // key_sz(2) + val_sz(4) + val_pos(8)
+)
+
+type hintEntry struct {
+	key    string
+	valSz  uint32
+	valPos int64
+}
+
 // EncodeRecord encodes a log record into the binary wire format.
 // Exported for use by the hint file writer and tests.
 func EncodeRecord(op byte, key string, value []byte) []byte {
@@ -113,7 +128,11 @@ type Store struct {
 	compactionThreshold int64
 }
 
-// Open opens (or creates) the log file at path and replays it to rebuild the index.
+// Open opens (or creates) the log file at path and rebuilds the index.
+// If a hint file exists it is loaded first (O(live keys)); the log is then
+// replayed only from the compacted boundary to EOF to pick up any writes
+// that occurred after the last compaction. Falls back to full log replay
+// when no valid hint file is found.
 func Open(path string) (*Store, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
@@ -125,39 +144,42 @@ func Open(path string) (*Store, error) {
 		index:               make(map[string]int64),
 		compactionThreshold: defaultCompactionThreshold,
 	}
-	if err := s.replay(); err != nil {
-		f.Close()
-		return nil, err
+	compactEnd, ok := s.loadHintFile()
+	if ok {
+		if err := s.replayFrom(compactEnd); err != nil {
+			f.Close()
+			return nil, err
+		}
+	} else {
+		if err := s.replayFrom(0); err != nil {
+			f.Close()
+			return nil, err
+		}
 	}
 	return s, nil
 }
 
-// replay scans the log from byte 0, rebuilds the index, and sets writePos.
-// A torn tail write (io.ErrUnexpectedEOF or last-record CRC mismatch) is
-// recovered by truncating the file to the last good record.
-// A CRC mismatch on a non-final record returns ErrCorrupt.
-func (s *Store) replay() error {
+// replayFrom scans the log from startOffset to EOF, updating the index and writePos.
+// A torn tail (io.ErrUnexpectedEOF or last-record CRC mismatch) is recovered by
+// truncating to the last good record. A CRC mismatch on a non-final record is fatal.
+func (s *Store) replayFrom(startOffset int64) error {
 	info, err := s.file.Stat()
 	if err != nil {
 		return err
 	}
 	fileSize := info.Size()
-	var offset int64
+	offset := startOffset
 
 	for offset < fileSize {
 		op, key, _, size, err := ReadRecordAt(s.file, offset)
 		if err != nil {
 			if errors.Is(err, io.ErrUnexpectedEOF) {
-				// Partial record at tail: truncate and recover.
 				return s.truncateToOffset(offset)
 			}
 			if errors.Is(err, ErrCorrupt) {
-				// Full record present but CRC wrong.
 				if offset+size >= fileSize {
-					// Last record: treat as tail corruption (partial OS flush).
 					return s.truncateToOffset(offset)
 				}
-				// Mid-file: serious corruption, do not silently skip.
 				return fmt.Errorf("corrupt record at offset %d: %w", offset, ErrCorrupt)
 			}
 			return err
@@ -173,6 +195,53 @@ func (s *Store) replay() error {
 	}
 	s.writePos = offset
 	return nil
+}
+
+// loadHintFile loads the hint file alongside the data file, populating s.index.
+// Returns (compactedSize, true) on success so Open can replay only the tail.
+// Returns (0, false) on any failure; the caller must fall back to full replay.
+func (s *Store) loadHintFile() (int64, bool) {
+	f, err := os.Open(s.path + ".hint")
+	if err != nil {
+		return 0, false
+	}
+	defer f.Close()
+
+	// 8-byte file header: data file size at compaction time.
+	var hdr [hintFileHeaderSize]byte
+	if n, err := f.ReadAt(hdr[:], 0); n < hintFileHeaderSize || (err != nil && !errors.Is(err, io.EOF)) {
+		return 0, false
+	}
+	compactSize := int64(binary.BigEndian.Uint64(hdr[:]))
+
+	info, err := f.Stat()
+	if err != nil {
+		return 0, false
+	}
+	fileSize := info.Size()
+	offset := int64(hintFileHeaderSize)
+	newIndex := make(map[string]int64)
+
+	for offset < fileSize {
+		var entHdr [hintEntryHeaderSize]byte
+		n, err := f.ReadAt(entHdr[:], offset)
+		if n < hintEntryHeaderSize || (err != nil && !errors.Is(err, io.EOF)) {
+			return 0, false
+		}
+		keySz := int(binary.BigEndian.Uint16(entHdr[0:2]))
+		valPos := int64(binary.BigEndian.Uint64(entHdr[6:14]))
+
+		key := make([]byte, keySz)
+		n, err = f.ReadAt(key, offset+hintEntryHeaderSize)
+		if n < keySz || (err != nil && !errors.Is(err, io.EOF)) {
+			return 0, false
+		}
+		newIndex[string(key)] = valPos
+		offset += int64(hintEntryHeaderSize + keySz)
+	}
+
+	s.index = newIndex
+	return compactSize, true
 }
 
 func (s *Store) truncateToOffset(offset int64) error {
@@ -267,7 +336,7 @@ func (s *Store) compact() error {
 	}
 	tmpPath := tmp.Name()
 
-	// Write one PUT record per live key into the temp file.
+	hints := make([]hintEntry, 0, len(s.index))
 	newIndex := make(map[string]int64, len(s.index))
 	var pos int64
 	for key, offset := range s.index {
@@ -284,6 +353,7 @@ func (s *Store) compact() error {
 			return err
 		}
 		newIndex[key] = pos
+		hints = append(hints, hintEntry{key, uint32(len(value)), pos})
 		pos += int64(len(rec))
 	}
 
@@ -297,11 +367,18 @@ func (s *Store) compact() error {
 		return err
 	}
 
-	// Atomic replace: old log → compacted log.
+	// Remove stale hint before renaming data file: if we crash between the data
+	// rename and the new hint write, Open will fall back to full replay rather
+	// than loading a hint that points into a now-different data file.
+	os.Remove(s.path + ".hint")
+
 	if err := os.Rename(tmpPath, s.path); err != nil {
 		os.Remove(tmpPath)
 		return err
 	}
+
+	// Best-effort: a missing hint file triggers full replay on the next Open.
+	_ = s.writeHintFile(pos, hints)
 
 	s.file.Close()
 	f, err := os.OpenFile(s.path, os.O_RDWR|os.O_CREATE, 0644)
@@ -312,4 +389,47 @@ func (s *Store) compact() error {
 	s.index = newIndex
 	s.writePos = pos
 	return nil
+}
+
+// writeHintFile atomically writes the hint file alongside the data file.
+// compactSize is the total byte length of the just-compacted data file.
+func (s *Store) writeHintFile(compactSize int64, hints []hintEntry) error {
+	dir := filepath.Dir(s.path)
+	tmp, err := os.CreateTemp(dir, "kv-hint-*.hint")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+
+	// 8-byte header: data file size at compaction time.
+	var hdr [hintFileHeaderSize]byte
+	binary.BigEndian.PutUint64(hdr[:], uint64(compactSize))
+	if _, err := tmp.WriteAt(hdr[:], 0); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+
+	off := int64(hintFileHeaderSize)
+	for _, h := range hints {
+		buf := make([]byte, hintEntryHeaderSize+len(h.key))
+		binary.BigEndian.PutUint16(buf[0:2], uint16(len(h.key)))
+		binary.BigEndian.PutUint32(buf[2:6], h.valSz)
+		binary.BigEndian.PutUint64(buf[6:14], uint64(h.valPos))
+		copy(buf[hintEntryHeaderSize:], h.key)
+		if _, err := tmp.WriteAt(buf, off); err != nil {
+			tmp.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+		off += int64(len(buf))
+	}
+
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	tmp.Close()
+	return os.Rename(tmpPath, s.path+".hint")
 }
