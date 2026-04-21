@@ -1,26 +1,38 @@
 # kvstore
 
-A distributed, fault-tolerant key-value store built as a study in storage engine and consensus fundamentals. V1 was a deliberately naive single-node implementation; V2 (in progress on branch `v1-raft`) adds durability, compaction, and Raft replication.
+A distributed, fault-tolerant key-value store built as a study in storage engine and consensus fundamentals. V1 was a deliberately naive single-node implementation; V2 (branch `v1-raft`) adds durability, compaction, and Raft replication.
 
 ## Architecture
 
 ```mermaid
 graph LR
     Client -->|HTTP PUT/GET/DELETE| Server["HTTP Server\ninternal/server"]
-    Server --> Store["Store FSM\ninternal/store"]
-    Store -->|append record| Log["Binary log\ndata/kv.log\n(CRC32 per record)"]
+    Server -->|write → raft.Apply| Raft["Raft node\ninternal/raftnode"]
+    Server -->|read → store.Get| Store
+    Raft -->|on commit → FSM.Apply| Store["Store FSM\ninternal/store"]
+    Store -->|append record| Log["Binary log\ndata/node*/kv.log\n(CRC32 per record)"]
     Store <-->|ReadAt offset| Log
     Store --- Index["In-memory index\nmap[key → offset]"]
-    Log -->|replay on startup| Index
+    Log -->|hint file or full replay| Index
+    Raft --- BoltDB["BoltDB\nRaft log + stable store"]
+    Raft --- Snaps["Snapshots\ndata/node*/raft/snapshots"]
 ```
 
-Every write appends a length-prefixed binary record with a CRC32 checksum before acknowledging the client. Reads use an in-memory index (`map[string]int64`) that maps each key to the byte offset of its latest record — no log scan per read. On startup the index is rebuilt from a hint file (O(live keys)) if one exists, otherwise by replaying the full log from byte 0.
+Writes go through `raft.Apply` and are committed only after a quorum of nodes acknowledges them. The FSM calls `store.Put`/`store.Delete` once the entry is committed. Reads go directly to the local store (potentially stale on followers; `?consistent=true` is a stretch-goal that adds a `raft.Barrier` call).
+
+Non-leader nodes return `307 Temporary Redirect` pointing at the current leader's HTTP address. Clients following redirects automatically route writes to the leader.
+
+The storage engine is the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) model: append-only writes for predictable latency, O(1) reads via an in-memory index. On startup the index is rebuilt from a hint file (O(live keys)) if one exists, otherwise by replaying the full log.
 
 ## Why this design
 
-This is the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) model: append-only writes for predictable latency, O(1) reads via an in-memory index.
+**Raft for consensus** — simpler to reason about than Paxos; the `hashicorp/raft` library provides a production-grade implementation that is widely used (Consul, Nomad, etcd-adjacent tooling).
 
-**V1 weaknesses — documented in `store_failures_test.go`:**
+**BoltDB-backed log/stable store** — the Raft log (and stable store for term/vote metadata) lives in BoltDB, separate from the KV data file. This separation keeps the KV log compact and compaction-friendly without disturbing Raft's own bookkeeping.
+
+**Node ID = HTTP address** — storing the HTTP address as the Raft `ServerID` allows any node to read the leader's HTTP address directly from `raft.LeaderWithID()` and include it in a redirect response, without a separate discovery mechanism.
+
+## V1 weaknesses — documented in `store_failures_test.go`
 
 | Failure | Test |
 |---------|------|
@@ -30,26 +42,23 @@ This is the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) model: append-o
 | Tombstones never reclaimed | `TestDeleteDoesNotReclaimDisk` |
 | Replay is O(write history), not O(live keys) | `TestReplayScansFullLogHistory` |
 
-**V2 fixes (branch `v1-raft`, see `v2-plan.md`):**
+## V2 fixes (branch `v1-raft`)
 
 | Step | Fix | Status |
 |------|-----|--------|
 | 0 | Binary log format + CRC32 per record | ✓ done |
-| 1 | WAL + `fsync` + crash recovery | in progress |
-| 2 | Atomic log compaction | pending |
-| 3 | Hint file for O(live-keys) startup | pending |
-| 4 | Raft replication across 3 nodes | pending |
+| 1 | WAL + `fsync` + crash recovery | ✓ done |
+| 2 | Atomic log compaction | ✓ done |
+| 3 | Hint file for O(live-keys) startup | ✓ done |
+| 4 | Raft replication across 3 nodes | ✓ done |
 
 ## What broke and how I fixed it
 
-V1 was instrumented with six deliberate failure tests. Running `go test -v ./internal/store/...` after each break-it scenario produced:
-
-- **Truncated write**: killing the process mid-write left a partial record in the log. On restart, `replay()` silently skipped it — the key was gone with no error to the operator.
-- **Log growth**: 100 overwrites of the same key produced 4 900 bytes on disk (V1 JSON) / 2 400 bytes (V2 binary) for a single live key. Disk usage grows linearly with write count, not key count.
+- **Truncated write**: killing the process mid-write left a partial record in the log. V1 silently skipped it — data loss with no error. V2 detects the torn tail via CRC mismatch and truncates to the last good record; the store opens cleanly.
+- **Log growth**: 100 overwrites of the same key produced 4 900 bytes on disk (V1 JSON) / 2 400 bytes (V2 binary) for a single live key. V2 compaction rewrites only live keys atomically; `kvdump` stale% drops to 0.
 - **Silent corruption**: a flipped byte in a middle record was skipped by V1's JSON parser with no error. V2's CRC check returns `ErrCorrupt` from `Open()`.
-- **Replay cost**: 10 000 stale entries took ~50 ms to replay in V1, ~18 ms in V2 (binary decode is faster than JSON; hint file will eliminate this entirely).
-
-The V2 binary format (Step 0) addressed checksums and reduced log size by ~57%. Steps 1–3 complete local durability. Step 4 adds fault tolerance.
+- **Replay cost**: 10 000 stale entries took ~25 ms to replay. After compaction produces a hint file, the same store reopens in ~54 µs — a 460× improvement.
+- **Single point of failure**: V1 had no replication. V2 uses `hashicorp/raft` with a 3-node cluster; the leader can fail and a new one is elected within the heartbeat timeout. Writes are linearizable.
 
 ## Build
 
@@ -61,35 +70,53 @@ make build          # outputs bin/kvserver and bin/kvdump
 
 ## Run
 
-```bash
-make run            # listens on :9090, log at data/kv.log
-```
-
-Or with custom flags:
+**Single node** (single-voter cluster, immediately becomes leader):
 
 ```bash
-./bin/kvserver -addr :9191 -log-file /tmp/kv.log
+make run            # listens on :9090, data in data/node1/
 ```
+
+**Three-node cluster** (nodes started in background):
+
+```bash
+make run-cluster    # nodes on :9091, :9092, :9093
+make stop-cluster
+```
+
+**Custom flags:**
+
+```bash
+./bin/kvserver \
+  -node-id  http://myhost:9091 \
+  -http-addr :9091 \
+  -raft-addr myhost:7001 \
+  -data-dir  /var/lib/kvstore/node1 \
+  -peers    "http://myhost:9091=myhost:7001,http://myhost:9092=myhost:7002,http://myhost:9093=myhost:7003"
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-node-id` | `http://localhost:9090` | This node's HTTP address; stored as Raft ServerID for leader redirects |
+| `-http-addr` | `:9090` | HTTP listen address |
+| `-raft-addr` | `localhost:7000` | Raft TCP bind address |
+| `-data-dir` | `data` | Directory for Raft state (BoltDB, snapshots) and KV log |
+| `-peers` | *(single-node)* | Comma-separated `nodeID=raftAddr` pairs for all cluster members |
 
 ## Test
 
 ```bash
-make test           # runs all tests with -race
-```
-
-To run a single package:
-
-```bash
-go test -race ./internal/store/...
-go test -race ./internal/server/...
+make test                              # all packages with -race
+go test -race -count=1 ./internal/store/...     # storage engine only
+go test -race -count=1 ./internal/raftnode/...  # Raft integration
+go test -race -count=1 ./internal/server/...    # HTTP handlers
 ```
 
 ## Diagnostics
 
-`kvdump` decodes and prints every record in a binary log file. Use it to inspect data, verify writes, and measure compaction effectiveness.
+`kvdump` decodes and prints every record in a binary log file.
 
 ```bash
-./bin/kvdump -log data/kv.log
+./bin/kvdump -log data/node1/kv.log
 ```
 
 Example output:
@@ -102,23 +129,23 @@ offset=104           DEL  key="session:abc"             24 bytes
 live keys: 0  |  records: 3  |  file: 128 bytes  |  stale: 128 bytes (100%)
 ```
 
-Records marked `STALE` would be removed by compaction. The summary line shows how much space a compaction would reclaim.
-
 ## Usage
 
 ```bash
-# Store a value
-curl -X PUT http://localhost:9090/keys/hello -d "world"
+# Store a value (routes to leader automatically via redirect)
+curl -L -X PUT http://localhost:9091/keys/hello -d "world"
 
 # Retrieve a value
-curl http://localhost:9090/keys/hello
+curl http://localhost:9091/keys/hello
 
 # Delete a key
-curl -X DELETE http://localhost:9090/keys/hello
+curl -L -X DELETE http://localhost:9091/keys/hello
 
-# Health check
-curl http://localhost:9090/health
+# Check node status (shows Raft leader info)
+curl http://localhost:9091/health
 ```
+
+The `-L` flag tells curl to follow the `307` redirect if the node you hit is not the leader.
 
 ## Branch model
 
@@ -132,28 +159,11 @@ Tags mark completed builds:
 | Tag | Description |
 |-----|-------------|
 | `v1.0.0` | V1 complete — single-node KV store with append-only log (JSON-lines) |
-| `v2.0.0` | V2 complete — WAL + fsync + Raft replication *(pending)* |
-
-Workflow for each build:
-
-```bash
-# 1. Cut a branch from the last stable tag
-git checkout -b v1-raft v1.0.0
-
-# 2. Implement, test, document on the branch
-make test
-
-# 3. Merge to main (no-ff preserves the branch in the graph)
-git switch main
-git merge --no-ff v1-raft
-
-# 4. Tag the completed build
-git tag -a v2.0.0 -m "V2: WAL + Raft replication"
-```
+| `v2.0.0` | V2 complete — WAL + fsync + compaction + hint file + Raft replication |
 
 ## What I'd do next
 
-- **Step 1**: WAL + `fsync` after every write; truncate torn tail on replay (`TestDataLossOnTruncatedWrite` should now fail)
-- **Step 2**: Atomic log compaction — `kvdump` stale% drops to 0 after compact
-- **Step 3**: Hint file — `TestReplayScansFullLogHistory` replay time drops to sub-millisecond
-- **Step 4**: Raft replication via `hashicorp/raft` — 3-node cluster, leader election, linearizable writes
+- **Linearizable reads**: add `?consistent=true` that calls `raft.Barrier()` before `store.Get`, preventing stale reads on followers
+- **Snapshot transfer**: implement `FSM.Snapshot`/`Restore` more robustly for nodes that join after log compaction has removed old entries
+- **Membership changes**: use `raft.AddVoter`/`raft.RemoveServer` to add and remove nodes without restarting the cluster
+- **Jepsen-lite test**: run a partition/kill scenario and verify linearizability with a checker like Knossos

@@ -319,6 +319,75 @@ func (s *Store) Delete(key string) error {
 	return nil
 }
 
+// Snapshot returns a copy of all live key-value pairs.
+// Used by the Raft FSM to produce a consistent point-in-time snapshot.
+func (s *Store) Snapshot() (map[string][]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string][]byte, len(s.index))
+	for key, offset := range s.index {
+		_, _, value, _, err := ReadRecordAt(s.file, offset)
+		if err != nil {
+			return nil, err
+		}
+		out[key] = value
+	}
+	return out, nil
+}
+
+// ReplaceContents atomically replaces the store's data with entries.
+// Used by the Raft FSM to restore state from a snapshot.
+func (s *Store) ReplaceContents(entries map[string][]byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dir := filepath.Dir(s.path)
+	tmp, err := os.CreateTemp(dir, "kv-restore-*.log")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+
+	newIndex := make(map[string]int64, len(entries))
+	var pos int64
+	for key, value := range entries {
+		rec := EncodeRecord(OpPut, key, value)
+		if _, err := tmp.WriteAt(rec, pos); err != nil {
+			tmp.Close()
+			os.Remove(tmpPath)
+			return err
+		}
+		newIndex[key] = pos
+		pos += int64(len(rec))
+	}
+
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+
+	os.Remove(s.path + ".hint")
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+
+	s.file.Close()
+	f, err := os.OpenFile(s.path, os.O_RDWR|os.O_CREATE, 0644)
+	if err != nil {
+		return err
+	}
+	s.file = f
+	s.index = newIndex
+	s.writePos = pos
+	return nil
+}
+
 // Compact rewrites the log to contain only live keys, atomically replacing the data file.
 // It is safe to call concurrently — it acquires the store lock for the duration.
 func (s *Store) Compact() error {

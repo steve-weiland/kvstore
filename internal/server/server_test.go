@@ -40,7 +40,7 @@ func (f *fakeStore) Delete(key string) error {
 }
 
 func TestHandlePutGet(t *testing.T) {
-	srv := server.New(newFakeStore())
+	srv := server.New(newFakeStore(), nil)
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
@@ -69,7 +69,7 @@ func TestHandlePutGet(t *testing.T) {
 }
 
 func TestHandleGetMissing(t *testing.T) {
-	srv := server.New(newFakeStore())
+	srv := server.New(newFakeStore(), nil)
 	ts := httptest.NewServer(srv)
 	defer ts.Close()
 
@@ -80,7 +80,7 @@ func TestHandleGetMissing(t *testing.T) {
 }
 
 func TestHandleHealth(t *testing.T) {
-	srv := server.New(newFakeStore())
+	srv := server.New(newFakeStore(), nil)
 	w := httptest.NewRecorder()
 	r := httptest.NewRequest(http.MethodGet, "/health", nil)
 	srv.ServeHTTP(w, r)
