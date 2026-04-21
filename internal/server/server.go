@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/sweiland/kvstore/internal/store"
+	"github.com/steve-weiland/kvstore/internal/store"
 )
 
 const maxValueBytes = 64 * 1024

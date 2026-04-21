@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sweiland/kvstore/internal/server"
-	"github.com/sweiland/kvstore/internal/store"
+	"github.com/steve-weiland/kvstore/internal/server"
+	"github.com/steve-weiland/kvstore/internal/store"
 )
 
 // fakeStore is an in-memory store used to isolate HTTP handler tests.

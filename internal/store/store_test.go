@@ -5,7 +5,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/sweiland/kvstore/internal/store"
+	"github.com/steve-weiland/kvstore/internal/store"
 )
 
 func openTemp(t *testing.T) *store.Store {

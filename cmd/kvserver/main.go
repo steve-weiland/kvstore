@@ -5,8 +5,8 @@ import (
 	"log"
 	"net/http"
 
-	"github.com/sweiland/kvstore/internal/server"
-	"github.com/sweiland/kvstore/internal/store"
+	"github.com/steve-weiland/kvstore/internal/server"
+	"github.com/steve-weiland/kvstore/internal/store"
 )
 
 func main() {
