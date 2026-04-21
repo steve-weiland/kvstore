@@ -210,7 +210,7 @@ func (s *Store) Put(key string, value []byte) error {
 	}
 	s.writePos += int64(len(rec))
 	s.index[key] = offset
-	return nil
+	return s.file.Sync()
 }
 
 // Delete appends a tombstone record to the log and removes the key from the index.
@@ -228,5 +228,5 @@ func (s *Store) Delete(key string) error {
 	}
 	s.writePos += int64(len(rec))
 	delete(s.index, key)
-	return nil
+	return s.file.Sync()
 }
