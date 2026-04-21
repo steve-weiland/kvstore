@@ -79,6 +79,37 @@ curl -X DELETE http://localhost:9090/keys/hello
 curl http://localhost:9090/health
 ```
 
+## Branch model
+
+| Branch | Purpose |
+|--------|---------|
+| `main` | Stable — tests must pass before merging. Completed builds are tagged here. |
+| `v<N>-<feature>` | Work branch for the next build, cut from `main` at the previous build's tag. |
+
+Tags mark completed builds:
+
+| Tag | Description |
+|-----|-------------|
+| `v1.0.0` | V1 complete — single-node KV store with append-only log |
+| `v2.0.0` | V2 complete — WAL + fsync + Raft replication |
+
+Workflow for each build:
+
+```bash
+# 1. Cut a branch from the last stable tag
+git checkout -b v1-raft v1.0.0
+
+# 2. Implement, test, document on the branch
+make test
+
+# 3. Merge to main (no-ff preserves the branch in the graph)
+git switch main
+git merge --no-ff v1-raft
+
+# 4. Tag the completed build
+git tag -a v2.0.0 -m "V2: WAL + Raft replication"
+```
+
 ## What I'd do next
 
 - Implement V2: `fsync` on every append, entry-level CRC, crash recovery from a truncated tail
