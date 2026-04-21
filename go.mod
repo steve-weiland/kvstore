@@ -1,3 +1,3 @@
-module github.com/sweiland/kvstore
+module github.com/steve-weiland/kvstore
 
 go 1.22.0
