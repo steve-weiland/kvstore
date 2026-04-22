@@ -121,6 +121,12 @@ func (n *Node) Apply(op, key string, value []byte) error {
 	return nil
 }
 
+// Barrier blocks until the FSM has applied all log entries up to the current
+// commit index. Use before a Get to guarantee a linearizable read.
+func (n *Node) Barrier(timeout time.Duration) error {
+	return n.raft.Barrier(timeout).Error()
+}
+
 // Shutdown gracefully stops the Raft node.
 func (n *Node) Shutdown() error {
 	return n.raft.Shutdown().Error()

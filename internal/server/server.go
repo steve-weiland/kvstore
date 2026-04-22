@@ -26,6 +26,9 @@ type Applier interface {
 	IsLeader() bool
 	// LeaderAddr returns the leader's HTTP address for client redirects ("" if unknown).
 	LeaderAddr() string
+	// Barrier blocks until the FSM has applied all log entries up to the current
+	// commit index, guaranteeing that a subsequent Get reflects all committed writes.
+	Barrier(timeout time.Duration) error
 }
 
 type Server struct {
@@ -50,6 +53,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
+	if s.applier != nil && r.URL.Query().Get("consistent") == "true" {
+		if err := s.applier.Barrier(5 * time.Second); err != nil {
+			jsonError(w, "barrier failed", http.StatusServiceUnavailable)
+			return
+		}
+	}
 	val, err := s.store.Get(key)
 	if errors.Is(err, store.ErrNotFound) {
 		jsonError(w, "key not found", http.StatusNotFound)
