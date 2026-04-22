@@ -1,6 +1,6 @@
 # kvstore
 
-A distributed, fault-tolerant key-value store built as a study in storage engine and consensus fundamentals. V1 was a deliberately naive single-node implementation; V2 (branch `v1-raft`) adds durability, compaction, and Raft replication.
+A distributed, fault-tolerant key-value store built as a study in storage engine and consensus fundamentals. V1 was a deliberately naive single-node implementation; V2 adds durability, compaction, and Raft replication.
 
 ## Architecture
 
@@ -18,7 +18,7 @@ graph LR
     Raft --- Snaps["Snapshots\ndata/node*/raft/snapshots"]
 ```
 
-Writes go through `raft.Apply` and are committed only after a quorum of nodes acknowledges them. The FSM calls `store.Put`/`store.Delete` once the entry is committed. Reads go directly to the local store (potentially stale on followers; `?consistent=true` is a stretch-goal that adds a `raft.Barrier` call).
+Writes go through `raft.Apply` and are committed only after a quorum of nodes acknowledges them. The FSM calls `store.Put`/`store.Delete` once the entry is committed. Reads go directly to the local store (potentially stale on followers); `?consistent=true` calls `raft.Barrier()` first for linearizable reads.
 
 Non-leader nodes return `307 Temporary Redirect` pointing at the current leader's HTTP address. Clients following redirects automatically route writes to the leader.
 
@@ -26,7 +26,7 @@ The storage engine is the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) m
 
 ## Why this design
 
-**Raft for consensus** — simpler to reason about than Paxos; the `hashicorp/raft` library provides a production-grade implementation that is widely used (Consul, Nomad, etcd-adjacent tooling).
+**Raft for consensus** — simpler to reason about than Paxos; the [`hashicorp/raft`](https://github.com/hashicorp/raft) library provides a production-grade implementation that is widely used (Consul, Nomad, etcd-adjacent tooling).
 
 **BoltDB-backed log/stable store** — the Raft log (and stable store for term/vote metadata) lives in BoltDB, separate from the KV data file. This separation keeps the KV log compact and compaction-friendly without disturbing Raft's own bookkeeping.
 
@@ -42,7 +42,7 @@ The storage engine is the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) m
 | Tombstones never reclaimed | `TestDeleteDoesNotReclaimDisk` |
 | Replay is O(write history), not O(live keys) | `TestReplayScansFullLogHistory` |
 
-## V2 fixes (branch `v1-raft`)
+## V2 fixes
 
 | Step | Fix | Status |
 |------|-----|--------|
@@ -168,6 +168,5 @@ Tags mark completed builds:
 
 ## What I'd do next
 
-- **Snapshot transfer**: stress-test `FSM.Snapshot`/`Restore` for nodes that join after Raft has truncated old log entries; verify they catch up via snapshot rather than log replay
 - **Membership changes**: use `raft.AddVoter`/`raft.RemoveServer` to add and remove nodes without restarting the cluster
 - **Jepsen-lite test**: run a partition/kill scenario and verify linearizability with a checker like Knossos

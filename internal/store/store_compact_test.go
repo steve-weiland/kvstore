@@ -132,3 +132,48 @@ func TestCompactSurvivesReopen(t *testing.T) {
 		t.Fatal("b should be gone after compact+reopen")
 	}
 }
+
+// TestCompactionThresholdTriggersAutoCompact opens a store with a tiny threshold
+// and verifies that auto-compact fires from inside Put at the right boundary.
+// Each record for key="k", value="val" is RecordHeaderSize+1+3 = 15 bytes.
+// With threshold=200: after 13 writes (195 B < 200) no compact; on the 14th
+// write writePos hits 210 ≥ 200, compact fires and reduces the file to 15 bytes.
+func TestCompactionThresholdTriggersAutoCompact(t *testing.T) {
+	f, _ := os.CreateTemp("", "kv-compact-*.log")
+	path := f.Name()
+	f.Close()
+	t.Cleanup(func() { os.Remove(path); os.Remove(path + ".hint") })
+
+	s, err := store.Open(path, store.WithCompactionThreshold(200))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	recordSize := int64(store.RecordHeaderSize + len("k") + len("val")) // 15 bytes
+
+	// 13 writes: writePos = 195 < 200 — no compact yet.
+	for i := 0; i < 13; i++ {
+		if err := s.Put("k", []byte("val")); err != nil {
+			t.Fatalf("Put %d: %v", i, err)
+		}
+	}
+	info, _ := os.Stat(path)
+	if info.Size() != 13*recordSize {
+		t.Fatalf("expected no compact before threshold: got %d bytes, want %d", info.Size(), 13*recordSize)
+	}
+
+	// 14th write: writePos hits 210 ≥ 200 → compact fires inside Put.
+	if err := s.Put("k", []byte("val")); err != nil {
+		t.Fatalf("Put 14: %v", err)
+	}
+	info, _ = os.Stat(path)
+	if info.Size() != recordSize {
+		t.Fatalf("expected compact after threshold: got %d bytes, want %d", info.Size(), recordSize)
+	}
+
+	got, err := s.Get("k")
+	if err != nil || string(got) != "val" {
+		t.Fatalf("Get after auto-compact: err=%v got=%q", err, got)
+	}
+}

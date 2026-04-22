@@ -2,6 +2,8 @@ package raftnode_test
 
 import (
 	"errors"
+	"fmt"
+	"net"
 	"path/filepath"
 	"testing"
 	"time"
@@ -71,5 +73,93 @@ func TestSingleNodeCluster(t *testing.T) {
 	// LeaderAddr returns this node's own ID when it's the leader.
 	if addr := node.LeaderAddr(); addr != "http://localhost:19091" {
 		t.Fatalf("LeaderAddr: got %q, want %q", addr, "http://localhost:19091")
+	}
+}
+
+// TestThreeNodeCluster spins up a 3-node Raft cluster, waits for leader election,
+// applies a single Put, and verifies all three stores converge to the same value.
+func TestThreeNodeCluster(t *testing.T) {
+	// Allocate 3 free TCP ports dynamically to avoid conflicts with other tests.
+	raftAddrs := make([]string, 3)
+	for i := range raftAddrs {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		raftAddrs[i] = ln.Addr().String()
+		ln.Close()
+	}
+
+	peers := make(map[string]string, 3)
+	for i, addr := range raftAddrs {
+		peers[fmt.Sprintf("node%d", i+1)] = addr
+	}
+
+	stores := make([]*store.Store, 3)
+	nodes := make([]*raftnode.Node, 3)
+
+	for i := range 3 {
+		dir := t.TempDir()
+		st, err := store.Open(filepath.Join(dir, "kv.log"), store.WithSyncWrites(false))
+		if err != nil {
+			t.Fatal(err)
+		}
+		stores[i] = st
+		t.Cleanup(func() { st.Close() })
+
+		node, err := raftnode.New(st, raftnode.Config{
+			NodeID:   fmt.Sprintf("node%d", i+1),
+			RaftAddr: raftAddrs[i],
+			DataDir:  dir,
+			Peers:    peers,
+		})
+		if err != nil {
+			t.Fatalf("node %d: %v", i+1, err)
+		}
+		nodes[i] = node
+		t.Cleanup(func() { node.Shutdown() })
+	}
+
+	// Wait for one leader to emerge.
+	var leader *raftnode.Node
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, n := range nodes {
+			if n.IsLeader() {
+				leader = n
+				break
+			}
+		}
+		if leader != nil {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if leader == nil {
+		t.Fatal("no leader elected within 10s")
+	}
+
+	if err := leader.Apply(raftnode.CmdPut, "foo", []byte("bar")); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	// All three stores must converge to "foo" → "bar".
+	for i, st := range stores {
+		convergeDeadline := time.Now().Add(3 * time.Second)
+		var got []byte
+		var err error
+		for time.Now().Before(convergeDeadline) {
+			got, err = st.Get("foo")
+			if err == nil {
+				break
+			}
+			if !errors.Is(err, store.ErrNotFound) {
+				t.Fatalf("store %d unexpected error: %v", i+1, err)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err != nil || string(got) != "bar" {
+			t.Fatalf("store %d: err=%v got=%q want=%q", i+1, err, got, "bar")
+		}
 	}
 }
