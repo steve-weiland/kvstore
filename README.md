@@ -102,6 +102,7 @@ make stop-cluster
 | `-raft-addr` | `localhost:7000` | Raft TCP bind address |
 | `-data-dir` | `data` | Directory for Raft state (BoltDB, snapshots) and KV log |
 | `-peers` | *(single-node)* | Comma-separated `nodeID=raftAddr` pairs for all cluster members |
+| `-compact-mb` | `32` | Compaction threshold in MB; log is rewritten when data file exceeds this size |
 
 ## Test
 
