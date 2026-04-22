@@ -78,8 +78,9 @@ func TestLogGrowsUnbounded(t *testing.T) {
 	}
 
 	info, _ := os.Stat(path)
-	// Each entry is ~50 bytes; N entries → file must be far larger than one entry.
-	const minExpected = 40 * N
+	// Binary record for "same-key"(8B) + "value"(5B): 11 + 8 + 5 = 24 bytes each.
+	// N records → at least 24*N bytes. Use 20*N as a conservative lower bound.
+	const minExpected = 20 * N
 	if info.Size() < minExpected {
 		t.Fatalf("log too small: got %d bytes, want > %d (no compaction means N entries on disk)", info.Size(), minExpected)
 	}
@@ -91,37 +92,35 @@ func TestLogGrowsUnbounded(t *testing.T) {
 	}
 }
 
-// TestCorruptEntryDroppedSilently writes a corrupt line between two valid entries.
-// V1: replay skips the bad line with no error. The surrounding keys survive; the
-// corrupted entry vanishes without any signal to the caller.
-func TestCorruptEntryDroppedSilently(t *testing.T) {
+// TestCorruptMiddleEntryIsDetected writes three records then flips a byte in the
+// middle record's value area. V2: Open must return ErrCorrupt — mid-file corruption
+// is no longer silently skipped.
+//
+// Record sizes for this test:
+//
+//	"before"    / "before"    → 11 + 6 + 6 = 23 bytes  (offset 0)
+//	"corrupt-me"/ "middle"    → 11 + 9 + 6 = 26 bytes  (offset 23; value starts at 23+11+9=43)
+//	"after"     / "after"     → 11 + 5 + 5 = 21 bytes  (offset 49)
+func TestCorruptMiddleEntryIsDetected(t *testing.T) {
 	f, _ := os.CreateTemp("", "kv-failure-*.log")
 	path := f.Name()
 	f.Close()
 	t.Cleanup(func() { os.Remove(path) })
 
-	raw, _ := os.OpenFile(path, os.O_WRONLY, 0)
-	// "before" = base64("before"), "after" = base64("after")
-	fmt.Fprintln(raw, `{"op":"put","key":"before","value":"YmVmb3Jl"}`)
-	fmt.Fprintln(raw, `NOT VALID JSON — simulating a bit-flip or torn sector`)
-	fmt.Fprintln(raw, `{"op":"put","key":"after","value":"YWZ0ZXI="}`)
+	s, _ := store.Open(path)
+	_ = s.Put("before", []byte("before"))
+	_ = s.Put("corrupt-me", []byte("middle"))
+	_ = s.Put("after", []byte("after"))
+
+	// Flip the first byte of "middle"'s value (offset 43) to corrupt the CRC.
+	raw, _ := os.OpenFile(path, os.O_RDWR, 0)
+	raw.WriteAt([]byte{0xFF}, 43)
 	raw.Close()
 
-	s, err := store.Open(path)
-	// V1: no error returned — corruption is silent.
-	if err != nil {
-		t.Fatalf("Open should not fail on corrupt middle entry: %v", err)
+	_, err := store.Open(path)
+	if !errors.Is(err, store.ErrCorrupt) {
+		t.Fatalf("expected ErrCorrupt for mid-file corruption, got: %v", err)
 	}
-
-	got, err := s.Get("before")
-	if err != nil || string(got) != "before" {
-		t.Fatalf("key before corrupt entry: err=%v got=%q", err, got)
-	}
-	got, err = s.Get("after")
-	if err != nil || string(got) != "after" {
-		t.Fatalf("key after corrupt entry: err=%v got=%q", err, got)
-	}
-	t.Log("corrupt middle entry silently dropped; no error returned from Open")
 }
 
 // TestDeleteDoesNotReclaimDisk verifies that deleting keys grows the log (tombstones
@@ -159,17 +158,14 @@ func TestDeleteDoesNotReclaimDisk(t *testing.T) {
 	}
 }
 
-// TestReplayScansFullLogHistory documents that startup time is O(total write history),
-// not O(live keys). There is no compaction, no hint file, no segment boundary —
-// Open must scan every byte ever written.
-//
-// No hard time assertion: this is an observability test. Run it before and after V2
-// adds compaction and compare the t.Logf output.
+// TestReplayScansFullLogHistory shows the O(write history) vs O(live keys) startup
+// difference. Without compaction the store replays every record ever written;
+// with compaction + hint file it loads only the live index and replays the tail.
 func TestReplayScansFullLogHistory(t *testing.T) {
 	f, _ := os.CreateTemp("", "kv-failure-*.log")
 	path := f.Name()
 	f.Close()
-	t.Cleanup(func() { os.Remove(path) })
+	t.Cleanup(func() { os.Remove(path); os.Remove(path + ".hint") })
 
 	s, _ := store.Open(path)
 	const N = 10_000
@@ -179,17 +175,28 @@ func TestReplayScansFullLogHistory(t *testing.T) {
 	info, _ := os.Stat(path)
 	t.Logf("log size after %d writes to same key: %d bytes", N, info.Size())
 
+	// V1 path: full replay without compaction.
 	start := time.Now()
 	s2, err := store.Open(path)
-	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("replaying %d stale entries took %v", N, elapsed)
+	t.Logf("full replay (%d stale entries): %v", N, time.Since(start))
 
-	got, err := s2.Get("key")
+	// V2 path: compact (produces hint file), then measure hint-assisted reopen.
+	if err := s2.Compact(); err != nil {
+		t.Fatalf("Compact: %v", err)
+	}
+	start = time.Now()
+	s3, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("hint-assisted reopen (1 live key): %v", time.Since(start))
+
+	got, err := s3.Get("key")
 	if err != nil || string(got) != "value" {
-		t.Fatalf("latest value wrong after replay: err=%v got=%q", err, got)
+		t.Fatalf("latest value wrong after hint reopen: err=%v got=%q", err, got)
 	}
 }
 
@@ -202,8 +209,9 @@ func TestReplayTombstoneWithoutPut(t *testing.T) {
 	f.Close()
 	t.Cleanup(func() { os.Remove(path) })
 
+	// Write a valid binary tombstone with no preceding PUT.
 	raw, _ := os.OpenFile(path, os.O_WRONLY, 0)
-	fmt.Fprintln(raw, `{"op":"del","key":"ghost"}`)
+	raw.Write(store.EncodeRecord(store.OpDel, "ghost", nil))
 	raw.Close()
 
 	s, err := store.Open(path)
