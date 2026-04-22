@@ -2,10 +2,10 @@
 
 | Field   | Value              |
 |---------|--------------------|
-| Version | 0.3 (draft)        |
+| Version | 0.4 (final)        |
 | Author  | Steve Weiland       |
 | Date    | 2026-04-21         |
-| Status  | In review          |
+| Status  | Accepted           |
 
 ---
 
@@ -132,9 +132,9 @@ GET /health
   200 OK
   {
     "status": "ok",
-    "raft_role": "leader" | "follower" | "candidate",
-    "raft_leader": "http://127.0.0.1:8081",
-    "uptime_seconds": 42
+    "uptime_seconds": 42,
+    "raft_leader": true | false,
+    "leader_addr": "http://localhost:9091"   // omitted when no Raft (single-node mode)
   }
 ```
 
@@ -153,29 +153,44 @@ byte order: big-endian
 
 ### Hint file record format
 
-One record per live key, written after every compaction. No CRC (hint is advisory; corrupt hint
-falls back to full replay).
+Written atomically (temp file + rename) after every compaction. No CRC per entry — a corrupt
+or missing hint file falls back to full log replay.
 
 ```
+┌──────────────────┐
+│ compact_size: 8  │   ← total byte length of the compacted data file
+├──────────────────┤
+│  per-key entries │
+└──────────────────┘
+
+Per-key entry:
 ┌─────────┬─────────┬────────────┬──────────────┐
 │ key_sz  │ val_sz  │  val_pos   │     key      │
 │ 2 bytes │ 4 bytes │  8 bytes   │ key_sz bytes │
 └─────────┴─────────┴────────────┴──────────────┘
 
-val_pos: byte offset of the record's start in data.log
+val_pos: byte offset of the record's start in the compacted data file
 byte order: big-endian
 ```
+
+On `Open()`: load hint → build index for the compacted prefix → replay data file from
+`compact_size` to EOF to pick up any writes appended after the last compaction.
 
 ### CLI flags (`kvserver`)
 
 ```
---node-id     string   unique node name, e.g. "node1"
---raft-addr   string   Raft TCP bind address, e.g. "127.0.0.1:7000"
+--node-id     string   this node's HTTP address, used as Raft ServerID for leader redirects
+                       e.g. "http://localhost:9091" (default "http://localhost:9090")
+--raft-addr   string   Raft TCP bind address, e.g. "localhost:7001" (default "localhost:7000")
 --http-addr   string   HTTP listen address (default ":9090")
---peers       string   comma-separated id=raft-addr pairs, e.g. "node2=127.0.0.1:7001,node3=127.0.0.1:7002"
---data-dir    string   directory for data.log, data.log.hint, raft.db, snapshots
---compact-mb  int      compaction threshold in MB (default 32)
+--peers       string   comma-separated nodeID=raftAddr pairs for all cluster members
+                       e.g. "http://localhost:9091=localhost:7001,http://localhost:9092=localhost:7002"
+                       omit for single-node mode (node registers itself as sole voter)
+--data-dir    string   directory for kv.log, kv.log.hint, raft/raft.db, raft/snapshots
+                       (default "data")
 ```
+
+Note: the compaction threshold is currently hardcoded at 32 MB; a `--compact-mb` flag is a planned addition.
 
 ---
 
@@ -190,12 +205,12 @@ byte order: big-endian
 
 ---
 
-## 6. Open Questions
+## 6. Resolved Decisions
 
-| # | Question | Owner | Due |
-|---|----------|-------|-----|
-| Q1 | **Compaction trigger**: size threshold only, or also time-based (e.g. every 1h)? Size-only is simpler; time-based helps workloads with mostly deletes. | Steve | Step 2 |
-| Q2 | **Leader redirect**: should the server proxy the write to the leader (transparent to client) or return a 307 (client must retry)? 307 is simpler; proxying hides topology from clients. | Steve | Step 4 |
+| # | Question | Decision |
+|---|----------|----------|
+| Q1 | **Compaction trigger**: size threshold only, or also time-based? | Size-only (32 MB default). Time-based adds complexity for minimal gain at V2 scale; revisit if delete-heavy workloads appear in benchmarks. |
+| Q2 | **Leader redirect**: proxy writes transparently, or return 307? | 307 redirect. Simpler to implement, makes cluster topology visible to operators, and standard HTTP clients follow redirects automatically with `-L`. |
 
 ---
 
@@ -206,3 +221,4 @@ byte order: big-endian
 | 0.1 | 2026-04-21 | Steve Weiland | Initial V1 draft |
 | 0.2 | 2026-04-21 | Steve Weiland | Resolved Q1–Q3: JSON-lines log format, octet-stream HTTP, full log replay |
 | 0.3 | 2026-04-21 | Steve Weiland | V2 draft: binary log + CRC, WAL/fsync, compaction, hint file, Raft replication |
+| 0.4 | 2026-04-21 | Steve Weiland | Final: resolved Q1/Q2, corrected CLI flags, hint file format, health response shape |

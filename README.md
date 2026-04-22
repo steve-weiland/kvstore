@@ -51,6 +51,7 @@ The storage engine is the [Bitcask](https://riak.com/assets/bitcask-intro.pdf) m
 | 2 | Atomic log compaction | ✓ done |
 | 3 | Hint file for O(live-keys) startup | ✓ done |
 | 4 | Raft replication across 3 nodes | ✓ done |
+| 5 | Linearizable reads via `?consistent=true` | ✓ done |
 
 ## What broke and how I fixed it
 
@@ -135,8 +136,11 @@ live keys: 0  |  records: 3  |  file: 128 bytes  |  stale: 128 bytes (100%)
 # Store a value (routes to leader automatically via redirect)
 curl -L -X PUT http://localhost:9091/keys/hello -d "world"
 
-# Retrieve a value
+# Retrieve a value (potentially stale local read — fast)
 curl http://localhost:9091/keys/hello
+
+# Linearizable read — calls raft.Barrier() before reading, guarantees no stale data
+curl "http://localhost:9091/keys/hello?consistent=true"
 
 # Delete a key
 curl -L -X DELETE http://localhost:9091/keys/hello
@@ -163,7 +167,7 @@ Tags mark completed builds:
 
 ## What I'd do next
 
-- **Linearizable reads**: add `?consistent=true` that calls `raft.Barrier()` before `store.Get`, preventing stale reads on followers
-- **Snapshot transfer**: implement `FSM.Snapshot`/`Restore` more robustly for nodes that join after log compaction has removed old entries
+- **Snapshot transfer**: stress-test `FSM.Snapshot`/`Restore` for nodes that join after Raft has truncated old log entries; verify they catch up via snapshot rather than log replay
 - **Membership changes**: use `raft.AddVoter`/`raft.RemoveServer` to add and remove nodes without restarting the cluster
+- **Compaction threshold flag**: wire `--compact-mb` CLI flag (currently hardcoded at 32 MB)
 - **Jepsen-lite test**: run a partition/kill scenario and verify linearizability with a checker like Knossos
