@@ -15,7 +15,7 @@ import (
 func TestSingleNodeCluster(t *testing.T) {
 	dir := t.TempDir()
 
-	st, err := store.Open(filepath.Join(dir, "kv.log"))
+	st, err := store.Open(filepath.Join(dir, "kv.log"), store.WithSyncWrites(false))
 	if err != nil {
 		t.Fatal(err)
 	}

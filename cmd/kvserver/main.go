@@ -25,7 +25,7 @@ func main() {
 		log.Fatalf("mkdir %s: %v", *dataDir, err)
 	}
 
-	st, err := store.Open(filepath.Join(*dataDir, "kv.log"))
+	st, err := store.Open(filepath.Join(*dataDir, "kv.log"), store.WithSyncWrites(false))
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}

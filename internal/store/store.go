@@ -116,6 +116,17 @@ func ReadRecordAt(r io.ReaderAt, offset int64) (op byte, key string, value []byt
 
 const defaultCompactionThreshold = 32 * 1024 * 1024 // 32 MB
 
+// Option configures a Store at open time.
+type Option func(*Store)
+
+// WithSyncWrites controls whether Put and Delete call file.Sync() after each write.
+// The default is true, which is safe for standalone use. Pass false when running
+// under Raft — BoltDB already fsyncs the committed log entry, and the KV file can
+// be rebuilt from the Raft log on crash, making the per-write fsync redundant.
+func WithSyncWrites(enabled bool) Option {
+	return func(s *Store) { s.syncWrites = enabled }
+}
+
 // Store is a single-node key-value store backed by a binary append-only log.
 // The in-memory index maps each key to the byte offset of its latest log entry.
 // All operations acquire a mutex to prevent interleaved log entries and index corruption.
@@ -126,6 +137,7 @@ type Store struct {
 	index               map[string]int64 // key → byte offset of latest record
 	writePos            int64            // current end-of-file; next write goes here
 	compactionThreshold int64
+	syncWrites          bool
 }
 
 // Open opens (or creates) the log file at path and rebuilds the index.
@@ -133,7 +145,7 @@ type Store struct {
 // replayed only from the compacted boundary to EOF to pick up any writes
 // that occurred after the last compaction. Falls back to full log replay
 // when no valid hint file is found.
-func Open(path string) (*Store, error) {
+func Open(path string, opts ...Option) (*Store, error) {
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, err
@@ -143,6 +155,10 @@ func Open(path string) (*Store, error) {
 		path:                path,
 		index:               make(map[string]int64),
 		compactionThreshold: defaultCompactionThreshold,
+		syncWrites:          true,
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	compactEnd, ok := s.loadHintFile()
 	if ok {
@@ -286,8 +302,10 @@ func (s *Store) Put(key string, value []byte) error {
 	}
 	s.writePos += int64(len(rec))
 	s.index[key] = offset
-	if err := s.file.Sync(); err != nil {
-		return err
+	if s.syncWrites {
+		if err := s.file.Sync(); err != nil {
+			return err
+		}
 	}
 	if s.writePos >= s.compactionThreshold {
 		_ = s.compact()
@@ -310,8 +328,10 @@ func (s *Store) Delete(key string) error {
 	}
 	s.writePos += int64(len(rec))
 	delete(s.index, key)
-	if err := s.file.Sync(); err != nil {
-		return err
+	if s.syncWrites {
+		if err := s.file.Sync(); err != nil {
+			return err
+		}
 	}
 	if s.writePos >= s.compactionThreshold {
 		_ = s.compact()
