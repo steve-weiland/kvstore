@@ -188,9 +188,8 @@ On `Open()`: load hint → build index for the compacted prefix → replay data 
                        omit for single-node mode (node registers itself as sole voter)
 --data-dir    string   directory for kv.log, kv.log.hint, raft/raft.db, raft/snapshots
                        (default "data")
+--compact-mb  int      compaction threshold in MB (default 32)
 ```
-
-Note: the compaction threshold is currently hardcoded at 32 MB; a `--compact-mb` flag is a planned addition.
 
 ---
 

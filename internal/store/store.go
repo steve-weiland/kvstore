@@ -127,6 +127,12 @@ func WithSyncWrites(enabled bool) Option {
 	return func(s *Store) { s.syncWrites = enabled }
 }
 
+// WithCompactionThreshold sets the data file size (in bytes) at which an automatic
+// compaction is triggered after a Put or Delete. Default is 32 MB.
+func WithCompactionThreshold(bytes int64) Option {
+	return func(s *Store) { s.compactionThreshold = bytes }
+}
+
 // Store is a single-node key-value store backed by a binary append-only log.
 // The in-memory index maps each key to the byte offset of its latest log entry.
 // All operations acquire a mutex to prevent interleaved log entries and index corruption.

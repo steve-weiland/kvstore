@@ -14,18 +14,23 @@ import (
 )
 
 func main() {
-	nodeID   := flag.String("node-id", "http://localhost:9090", "this node's HTTP address (used as Raft ServerID for leader redirects)")
-	httpAddr := flag.String("http-addr", ":9090", "HTTP listen address")
-	raftAddr := flag.String("raft-addr", "localhost:7000", "Raft TCP bind address")
-	dataDir  := flag.String("data-dir", "data", "directory for Raft state and KV log")
-	peersStr := flag.String("peers", "", "cluster peers: nodeID1=raftAddr1,nodeID2=raftAddr2,... (defaults to single-node)")
+	nodeID    := flag.String("node-id", "http://localhost:9090", "this node's HTTP address (used as Raft ServerID for leader redirects)")
+	httpAddr  := flag.String("http-addr", ":9090", "HTTP listen address")
+	raftAddr  := flag.String("raft-addr", "localhost:7000", "Raft TCP bind address")
+	dataDir   := flag.String("data-dir", "data", "directory for Raft state and KV log")
+	peersStr  := flag.String("peers", "", "cluster peers: nodeID1=raftAddr1,nodeID2=raftAddr2,... (defaults to single-node)")
+	compactMB := flag.Int64("compact-mb", 32, "compaction threshold in MB")
 	flag.Parse()
 
 	if err := os.MkdirAll(*dataDir, 0755); err != nil {
 		log.Fatalf("mkdir %s: %v", *dataDir, err)
 	}
 
-	st, err := store.Open(filepath.Join(*dataDir, "kv.log"), store.WithSyncWrites(false))
+	st, err := store.Open(
+		filepath.Join(*dataDir, "kv.log"),
+		store.WithSyncWrites(false),
+		store.WithCompactionThreshold(*compactMB*1024*1024),
+	)
 	if err != nil {
 		log.Fatalf("open store: %v", err)
 	}

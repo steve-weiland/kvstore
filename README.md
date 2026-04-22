@@ -169,5 +169,4 @@ Tags mark completed builds:
 
 - **Snapshot transfer**: stress-test `FSM.Snapshot`/`Restore` for nodes that join after Raft has truncated old log entries; verify they catch up via snapshot rather than log replay
 - **Membership changes**: use `raft.AddVoter`/`raft.RemoveServer` to add and remove nodes without restarting the cluster
-- **Compaction threshold flag**: wire `--compact-mb` CLI flag (currently hardcoded at 32 MB)
 - **Jepsen-lite test**: run a partition/kill scenario and verify linearizability with a checker like Knossos
