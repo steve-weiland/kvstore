@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -34,7 +35,7 @@ var (
 // Hint file layout:
 //
 //	[compact_size : 8 bytes]           ← data file size at compaction time
-//	[key_sz : 2][val_sz : 4][val_pos : 8][key : key_sz bytes]  ← one per live key
+//	[key_sz : 2][val_sz : 4][rec_off : 8][key : key_sz bytes]  ← one per live key
 const (
 	hintFileHeaderSize  = 8
 	hintEntryHeaderSize = 14 // key_sz(2) + val_sz(4) + val_pos(8)
@@ -43,7 +44,7 @@ const (
 type hintEntry struct {
 	key    string
 	valSz  uint32
-	valPos int64
+	recOff int64 // record offset in the data file (the index value)
 }
 
 // EncodeRecord encodes a log record into the binary wire format.
@@ -251,14 +252,14 @@ func (s *Store) loadHintFile() (int64, bool) {
 			return 0, false
 		}
 		keySz := int(binary.BigEndian.Uint16(entHdr[0:2]))
-		valPos := int64(binary.BigEndian.Uint64(entHdr[6:14]))
+		recOff := int64(binary.BigEndian.Uint64(entHdr[6:14]))
 
 		key := make([]byte, keySz)
 		n, err = f.ReadAt(key, offset+hintEntryHeaderSize)
 		if n < keySz || (err != nil && !errors.Is(err, io.EOF)) {
 			return 0, false
 		}
-		newIndex[string(key)] = valPos
+		newIndex[string(key)] = recOff
 		offset += int64(hintEntryHeaderSize + keySz)
 	}
 
@@ -335,7 +336,13 @@ func (s *Store) Put(key string, value []byte) error {
 		}
 	}
 	if s.writePos >= s.compactionThreshold {
-		_ = s.compact()
+		// The write itself succeeded — a compaction failure must not fail it
+		// (under Raft that would error an already-committed entry). But a
+		// disk-full compaction failing forever with zero signal is how a log
+		// quietly grows past its threshold: log it.
+		if err := s.compact(); err != nil {
+			slog.Warn("compaction failed; log continues to grow", "path", s.path, "error", err)
+		}
 	}
 	return nil
 }
@@ -361,7 +368,9 @@ func (s *Store) Delete(key string) error {
 		}
 	}
 	if s.writePos >= s.compactionThreshold {
-		_ = s.compact()
+		if err := s.compact(); err != nil {
+			slog.Warn("compaction failed; log continues to grow", "path", s.path, "error", err)
+		}
 	}
 	return nil
 }
@@ -548,7 +557,7 @@ func (s *Store) writeHintFile(compactSize int64, hints []hintEntry) error {
 		buf := make([]byte, hintEntryHeaderSize+len(h.key))
 		binary.BigEndian.PutUint16(buf[0:2], uint16(len(h.key)))
 		binary.BigEndian.PutUint32(buf[2:6], h.valSz)
-		binary.BigEndian.PutUint64(buf[6:14], uint64(h.valPos))
+		binary.BigEndian.PutUint64(buf[6:14], uint64(h.recOff))
 		copy(buf[hintEntryHeaderSize:], h.key)
 		if _, err := tmp.WriteAt(buf, off); err != nil {
 			tmp.Close()
