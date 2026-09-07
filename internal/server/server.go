@@ -55,6 +55,16 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("key")
 	if s.applier != nil && r.URL.Query().Get("consistent") == "true" {
 		if err := s.applier.Barrier(5 * time.Second); err != nil {
+			// Barrier is leader-only: on a follower, find the leader the same
+			// way writes do — a 307 preserving the query — instead of the
+			// pre-fix dead-end 503. Only when no leader is known does the
+			// client get the 503.
+			if !s.applier.IsLeader() {
+				if addr := s.applier.LeaderAddr(); addr != "" {
+					http.Redirect(w, r, addr+r.URL.RequestURI(), http.StatusTemporaryRedirect)
+					return
+				}
+			}
 			jsonError(w, "barrier failed", http.StatusServiceUnavailable)
 			return
 		}

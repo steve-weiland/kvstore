@@ -141,7 +141,8 @@ curl -L -X PUT http://localhost:9091/keys/hello -d "world"
 curl http://localhost:9091/keys/hello
 
 # Linearizable read — calls raft.Barrier() before reading, guarantees no stale data
-curl "http://localhost:9091/keys/hello?consistent=true"
+# (follows a 307 to the leader when the node you hit is a follower — Barrier is leader-only)
+curl -L "http://localhost:9091/keys/hello?consistent=true"
 
 # Delete a key
 curl -L -X DELETE http://localhost:9091/keys/hello

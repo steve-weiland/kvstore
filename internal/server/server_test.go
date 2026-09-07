@@ -54,9 +54,9 @@ func (a *fakeApplier) Apply(op, key string, value []byte) error {
 	}
 	return a.store.Delete(key)
 }
-func (a *fakeApplier) IsLeader() bool                    { return a.leader }
-func (a *fakeApplier) LeaderAddr() string                { return "" }
-func (a *fakeApplier) Barrier(_ time.Duration) error     { return a.barrierErr }
+func (a *fakeApplier) IsLeader() bool                { return a.leader }
+func (a *fakeApplier) LeaderAddr() string            { return "" }
+func (a *fakeApplier) Barrier(_ time.Duration) error { return a.barrierErr }
 
 func TestHandlePutGet(t *testing.T) {
 	srv := server.New(newFakeStore(), nil)
@@ -142,5 +142,35 @@ func TestConsistentReadBarrierFailure(t *testing.T) {
 	srv.ServeHTTP(w, r)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("got %d, want 503", w.Code)
+	}
+}
+
+// A consistent read on a follower must find the leader, not dead-end.
+// Barrier() is leader-only in hashicorp/raft, so pre-fix a follower answered
+// ?consistent=true with a bare 503 "barrier failed" — while writes already
+// solve the same problem with a 307 to the leader. Reads follow suit.
+type followerApplier struct{}
+
+func (followerApplier) Apply(string, string, []byte) error { return errNotLeaderStub }
+func (followerApplier) IsLeader() bool                     { return false }
+func (followerApplier) LeaderAddr() string                 { return "http://leader:9999" }
+func (followerApplier) Barrier(time.Duration) error        { return errNotLeaderStub }
+
+var errNotLeaderStub = errors.New("node is not the leader")
+
+func TestConsistentReadOnFollowerRedirectsToLeader(t *testing.T) {
+	srv := server.New(&fakeStore{m: map[string][]byte{}}, followerApplier{})
+
+	req := httptest.NewRequest("GET", "/keys/hello?consistent=true", nil)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+
+	if w.Code != http.StatusTemporaryRedirect {
+		t.Fatalf("consistent read on follower: got %d, want 307 (pre-fix: 503 barrier failed)", w.Code)
+	}
+	loc := w.Header().Get("Location")
+	want := "http://leader:9999/keys/hello?consistent=true"
+	if loc != want {
+		t.Fatalf("redirect Location = %q, want %q (query preserved)", loc, want)
 	}
 }
