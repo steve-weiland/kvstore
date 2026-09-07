@@ -2,7 +2,7 @@
 
 | Field   | Value              |
 |---------|--------------------|
-| Version | 0.4 (final)        |
+| Version | 0.5                |
 | Author  | Steve Weiland       |
 | Date    | 2026-04-21         |
 | Status  | Accepted           |
@@ -91,6 +91,8 @@ Requirements use [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) keywords: **
 | KV‑23 | Node identity, Raft bind address, HTTP bind address, initial peer list, and data directory **MUST** be configurable via CLI flags. |
 | KV‑24 | The cluster **SHOULD** consist of exactly 3 nodes for a quorum of 2. |
 | KV‑25 | Each node **MUST** use BoltDB-backed LogStore and StableStore (`hashicorp/raft-boltdb`). |
+| KV‑26 | A read **MUST NOT** return a record whose key differs from the requested key: `Get` verifies the decoded record's key against the request and returns `ErrCorrupt` on mismatch. The CRC proves a well-formed record, not the RIGHT record — a wrong index (e.g. a stale hint surviving a crash) must surface as an error, never as another key's value. |
+| KV‑27 | Every rename/remove in compaction, hint writing, and snapshot restore **MUST** be followed by a directory fsync: rename durability is not ordered without it, and the surviving old-hint + new-data pair is exactly the wrong-index case KV‑26 guards. |
 
 ---
 
@@ -221,3 +223,4 @@ On `Open()`: load hint → build index for the compacted prefix → replay data 
 | 0.2 | 2026-04-21 | Steve Weiland | Resolved Q1–Q3: JSON-lines log format, octet-stream HTTP, full log replay |
 | 0.3 | 2026-04-21 | Steve Weiland | V2 draft: binary log + CRC, WAL/fsync, compaction, hint file, Raft replication |
 | 0.4 | 2026-04-21 | Steve Weiland | Final: resolved Q1/Q2, corrected CLI flags, hint file format, health response shape |
+| 0.5 | 2026-09-06 | Steve Weiland | Review fixes: KV‑26 (Get refuses a valid record for a DIFFERENT key — red test returned "beta-value" for alpha pre-fix, silently) and KV‑27 (directory fsyncs after every rename/remove in compact/hint/restore — the crash-ordering the hint-removal comment assumed but nothing enforced). |

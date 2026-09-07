@@ -266,6 +266,20 @@ func (s *Store) loadHintFile() (int64, bool) {
 	return compactSize, true
 }
 
+// fsyncDir makes preceding renames/removes in dir durable and ORDERED: on
+// POSIX, rename/unlink durability requires fsyncing the directory. Without
+// this, a crash can persist compaction's steps out of order — the dangerous
+// survivor being OLD hint + NEW data file, whose stale offsets Get's key
+// check then refuses (instead of serving another key's value).
+func fsyncDir(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
+}
+
 func (s *Store) truncateToOffset(offset int64) error {
 	if err := s.file.Truncate(offset); err != nil {
 		return err
@@ -289,9 +303,16 @@ func (s *Store) Get(key string) ([]byte, error) {
 		return nil, ErrNotFound
 	}
 
-	_, _, value, _, err := ReadRecordAt(s.file, offset)
+	_, rkey, value, _, err := ReadRecordAt(s.file, offset)
 	if err != nil {
 		return nil, err
+	}
+	// The CRC proves "a well-formed record", not "the record for THIS key".
+	// If the index is ever wrong (e.g. a stale hint surviving a crash-
+	// misordered rename), a valid record for another key must be refused —
+	// returning it would be silently wrong data.
+	if rkey != key {
+		return nil, fmt.Errorf("index for %q points at record for %q: %w", key, rkey, ErrCorrupt)
 	}
 	return value, nil
 }
@@ -398,8 +419,15 @@ func (s *Store) ReplaceContents(entries map[string][]byte) error {
 	}
 
 	os.Remove(s.path + ".hint")
+	if err := fsyncDir(dir); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
 	if err := os.Rename(tmpPath, s.path); err != nil {
 		os.Remove(tmpPath)
+		return err
+	}
+	if err := fsyncDir(dir); err != nil {
 		return err
 	}
 
@@ -463,12 +491,22 @@ func (s *Store) compact() error {
 	}
 
 	// Remove stale hint before renaming data file: if we crash between the data
-	// rename and the new hint write, Open will fall back to full replay rather
-	// than loading a hint that points into a now-different data file.
+	// rename and the new hint write, Open falls back to full replay rather
+	// than loading a hint that points into a now-different data file. The
+	// directory fsync between the two makes that ORDER durable — without it,
+	// the kernel may persist the rename but not the remove, leaving the
+	// old-hint + new-data pair the comment above assumes can't happen.
 	os.Remove(s.path + ".hint")
+	if err := fsyncDir(dir); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
 
 	if err := os.Rename(tmpPath, s.path); err != nil {
 		os.Remove(tmpPath)
+		return err
+	}
+	if err := fsyncDir(dir); err != nil {
 		return err
 	}
 
@@ -526,5 +564,8 @@ func (s *Store) writeHintFile(compactSize int64, hints []hintEntry) error {
 		return err
 	}
 	tmp.Close()
-	return os.Rename(tmpPath, s.path+".hint")
+	if err := os.Rename(tmpPath, s.path+".hint"); err != nil {
+		return err
+	}
+	return fsyncDir(dir)
 }
